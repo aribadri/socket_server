@@ -1,6 +1,6 @@
 const crypto = require("crypto");
 
-const createSocketServer = (io) => {
+const createSocketServer = (io, { getAvatarUrl } = {}) => {
   // In-memory room store (max 2 players: host + guest).
   const rooms = new Map();
 
@@ -36,6 +36,25 @@ const createSocketServer = (io) => {
     };
   };
 
+  const requestAvatar = (socket, roomId, role) => {
+    if (!getAvatarUrl) return;
+    const user = socket.data && socket.data.user ? socket.data.user : null;
+    if (!user || !user.id) return;
+    if (user.photo_url) return;
+    getAvatarUrl(user.id)
+      .then((url) => {
+        if (!url) return;
+        const room = rooms.get(roomId);
+        if (!room) return;
+        const key = role === "host" ? "hostUser" : "guestUser";
+        if (!room[key]) return;
+        if (room[key].avatar) return;
+        room[key].avatar = url;
+        emitRoomUpdate(roomId);
+      })
+      .catch(() => {});
+  };
+
   const emitRoomUpdate = (roomId) => {
     // Broadcast current room state to all members.
     const room = rooms.get(roomId);
@@ -44,6 +63,7 @@ const createSocketServer = (io) => {
       roomId,
       host: room.hostUser || null,
       guest: room.guestUser || null,
+      removedTargets: room.removedTargets ? Array.from(room.removedTargets) : [],
     });
   };
 
@@ -87,6 +107,7 @@ const createSocketServer = (io) => {
           room.guestUser = buildProfile(socket);
         }
         emitRoomUpdate(roomId);
+        requestAvatar(socket, roomId, role);
       }
     });
 
@@ -98,15 +119,24 @@ const createSocketServer = (io) => {
         guestId: null,
         hostUser,
         guestUser: null,
+        removedTargets: new Set(),
         createdAt: Date.now(),
       });
       socket.join(roomId);
       socket.data.roomId = roomId;
       socket.data.role = "host";
 
-      const response = { ok: true, roomId, role: "host", host: hostUser, guest: null };
+      const response = {
+        ok: true,
+        roomId,
+        role: "host",
+        host: hostUser,
+        guest: null,
+        removedTargets: [],
+      };
       socket.emit("room_created", response);
       emitRoomUpdate(roomId);
+      requestAvatar(socket, roomId, "host");
       if (typeof cb === "function") cb(response);
     });
 
@@ -139,12 +169,14 @@ const createSocketServer = (io) => {
         role: "guest",
         host: room.hostUser || null,
         guest: room.guestUser || null,
+        removedTargets: room.removedTargets ? Array.from(room.removedTargets) : [],
       };
       socket.emit("room_joined", response);
       socket
         .to(roomId)
         .emit("peer_joined", { roomId, guestId: socket.id, guest: room.guestUser || null });
       emitRoomUpdate(roomId);
+      requestAvatar(socket, roomId, "guest");
       if (typeof cb === "function") cb(response);
     });
 
@@ -156,10 +188,18 @@ const createSocketServer = (io) => {
       const roomId =
         payload && payload.roomId ? payload.roomId : socket.data.roomId;
       if (!roomId) return;
-      socket.to(roomId).emit("signal", {
+      const data = payload && payload.data ? payload.data : null;
+      if (data && data.type === "hit" && data.targetId) {
+        const room = rooms.get(roomId);
+        if (room) {
+          if (!room.removedTargets) room.removedTargets = new Set();
+          room.removedTargets.add(String(data.targetId));
+        }
+      }
+      io.to(roomId).emit("signal", {
         roomId,
         from: socket.id,
-        data: payload && payload.data ? payload.data : null,
+        data,
       });
     });
 
@@ -174,6 +214,8 @@ const createSocketServer = (io) => {
             ...snapshot,
             host: room ? room.hostUser || null : null,
             guest: room ? room.guestUser || null : null,
+            removedTargets:
+              room && room.removedTargets ? Array.from(room.removedTargets) : [],
           }
         : { ok: false, roomId };
       if (typeof cb === "function") cb(response);
